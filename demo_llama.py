@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 
-from tee_gpu_demo.model_cache import DEFAULT_CACHE_DIR, DEFAULT_LLAMA_MODEL, cache_hf_model
+from tee_gpu_demo.model_cache import DEFAULT_CACHE_DIR, DEFAULT_LLAMA_MODEL, cache_hf_model, resolve_model_name_or_path
 
 
 DEFAULT_LLAMA_LINEAR_NAMES = (
@@ -105,6 +105,7 @@ def load_model(
 ):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    model_name = resolve_model_name_or_path(model_name)
     # Transformers receives the same cache policy for tokenizer and weights.
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,

@@ -752,3 +752,151 @@ class MaskedAttentionCache:
         scores = torch.matmul(q, self.private_keys.transpose(-1, -2)) * scale
         probabilities = torch.softmax(scores.float(), dim=-1).to(self.trusted_dtype)
         return torch.matmul(probabilities, self.private_values)
+
+
+def batched_masked_attention_query(
+    caches: Sequence[MaskedAttentionCache],
+    queries: Sequence[Tensor],
+    *,
+    scale: Optional[float] = None,
+    attention_masks: Optional[Sequence[Optional[Tensor]]] = None,
+    dropout_p: float = 0.0,
+    training: bool = False,
+) -> List[MaskedAttentionQueryResult]:
+    """Query multiple masked attention caches with batched GPU QK/PV matmuls.
+
+    The caches may have different KV lengths. The untrusted side sees padded
+    masked Q/K/P/V tensors and runs one batched QK plus one batched PV matmul.
+    Trusted correction, masking, and softmax remain per request because each
+    request owns independent low-rank masks and cache metadata.
+    """
+
+    if len(caches) != len(queries):
+        raise ValueError("caches and queries must have the same length")
+    if not caches:
+        return []
+    if attention_masks is None:
+        attention_masks = [None] * len(caches)
+    if len(attention_masks) != len(caches):
+        raise ValueError("attention_masks must be None or match caches length")
+
+    dim = caches[0].dim
+    trusted_device = caches[0].trusted_device
+    untrusted_device = caches[0].untrusted_device
+    trusted_dtype = caches[0].trusted_dtype
+    untrusted_dtype = caches[0].dtype
+    for cache in caches:
+        if cache.dim != dim:
+            raise ValueError("all caches must have the same dim")
+        if cache.trusted_device != trusted_device or cache.untrusted_device != untrusted_device:
+            raise ValueError("all caches must use the same trusted and untrusted devices")
+        if cache.trusted_dtype != trusted_dtype or cache.dtype != untrusted_dtype:
+            raise ValueError("all caches must use the same trusted and untrusted dtypes")
+        if not cache._masked_value_chunks:
+            raise RuntimeError("append at least one K/V chunk to every cache before querying")
+
+    trusted_queries: List[Tensor] = []
+    trusted_u: List[Tensor] = []
+    masked_queries: List[Tensor] = []
+    masked_keys: List[Tensor] = []
+    q_lens: List[int] = []
+    kv_lens: List[int] = []
+
+    for cache, query in zip(caches, queries):
+        if query.ndim != 2 or query.shape[-1] != dim:
+            raise ValueError(f"each query must be shaped [query_rows, {dim}]")
+        q = query.to(device=trusted_device, dtype=trusted_dtype)
+        u = _randn(
+            (*q.shape[:-1], cache.k_cache.query_rank),
+            dtype=trusted_dtype,
+            device=trusted_device,
+            generator=cache.generator,
+            scale=cache.mask_scale,
+        )
+        query_mask = torch.matmul(u, cache.k_cache.query_basis)
+        masked_query_t = q + query_mask
+        masked_query = masked_query_t.to(device=untrusted_device, dtype=untrusted_dtype)
+
+        trusted_queries.append(q)
+        trusted_u.append(u)
+        masked_queries.append(masked_query)
+        masked_keys.append(cache.masked_keys)
+        q_lens.append(q.shape[-2])
+        kv_lens.append(cache.masked_keys.shape[-2])
+
+    batch_size = len(caches)
+    max_q_len = max(q_lens)
+    max_kv_len = max(kv_lens)
+    padded_q = torch.zeros((batch_size, max_q_len, dim), dtype=untrusted_dtype, device=untrusted_device)
+    padded_k = torch.zeros((batch_size, max_kv_len, dim), dtype=untrusted_dtype, device=untrusted_device)
+    for index, (masked_query, masked_key, q_len, kv_len) in enumerate(
+        zip(masked_queries, masked_keys, q_lens, kv_lens)
+    ):
+        padded_q[index, :q_len] = masked_query
+        padded_k[index, :kv_len] = masked_key
+
+    qk_masked_output = torch.bmm(padded_q, padded_k.transpose(1, 2))
+    qk_masked_output_t = qk_masked_output.to(device=trusted_device, dtype=trusted_dtype)
+
+    probabilities: List[Tensor] = []
+    p_masks: List[LowRankMask] = []
+    scores_list: List[Tensor] = []
+    for index, (cache, q, u, attention_mask, q_len, kv_len) in enumerate(
+        zip(caches, trusted_queries, trusted_u, attention_masks, q_lens, kv_lens)
+    ):
+        q_key_mask_terms = []
+        for key_mask in cache.k_cache._key_masks:
+            q_key_mask_terms.append(_q_times_low_rank_t(q.unsqueeze(-2), key_mask).squeeze(-2))
+        q_key_mask = torch.cat(q_key_mask_terms, dim=-1)
+        basis_to_masked = torch.cat(cache.k_cache._basis_to_masked_chunks, dim=-1)
+        query_mask_term = torch.matmul(u, basis_to_masked)
+        qk_correction = q_key_mask + query_mask_term
+
+        unscaled_scores = qk_masked_output_t[index, :q_len, :kv_len] - qk_correction
+        request_scale = scale if scale is not None else 1.0 / math.sqrt(cache.dim)
+        scores = unscaled_scores * request_scale
+        if attention_mask is not None:
+            scores = scores + attention_mask.to(device=trusted_device, dtype=scores.dtype)
+        probs = torch.softmax(scores.float(), dim=-1).to(trusted_dtype)
+        if dropout_p:
+            probs = F.dropout(probs, p=dropout_p, training=training)
+        p_mask = LowRankMask.random(
+            probs,
+            cache.prob_rank,
+            generator=cache.generator,
+            scale=cache.mask_scale,
+        )
+        scores_list.append(scores)
+        probabilities.append(probs)
+        p_masks.append(p_mask)
+
+    padded_p = torch.zeros((batch_size, max_q_len, max_kv_len), dtype=untrusted_dtype, device=untrusted_device)
+    padded_v = torch.zeros((batch_size, max_kv_len, dim), dtype=untrusted_dtype, device=untrusted_device)
+    for index, (cache, probs, p_mask, q_len, kv_len) in enumerate(zip(caches, probabilities, p_masks, q_lens, kv_lens)):
+        masked_p_t = probs + p_mask.materialize()
+        padded_p[index, :q_len, :kv_len] = masked_p_t.to(device=untrusted_device, dtype=untrusted_dtype)
+        padded_v[index, :kv_len] = cache.masked_values
+
+    pv_masked_output = torch.bmm(padded_p, padded_v)
+    pv_masked_output_t = pv_masked_output.to(device=trusted_device, dtype=trusted_dtype)
+
+    results: List[MaskedAttentionQueryResult] = []
+    for index, (cache, probs, p_mask, q_len, kv_len) in enumerate(zip(caches, probabilities, p_masks, q_lens, kv_lens)):
+        correction = (
+            cache._p_times_value_masks(probs)
+            + _low_rank_times_x(p_mask, cache.private_values)
+            + cache._p_mask_times_value_masks(p_mask)
+        )
+        output = pv_masked_output_t[index, :q_len] - correction
+        results.append(
+            MaskedAttentionQueryResult(
+                output=output,
+                scores=scores_list[index],
+                probabilities=probs,
+                qk_masked_output=qk_masked_output[index, :q_len, :kv_len],
+                pv_masked_output=pv_masked_output[index, :q_len],
+                correction=correction,
+            )
+        )
+
+    return results

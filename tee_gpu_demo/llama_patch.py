@@ -355,16 +355,66 @@ def _masked_cache_len(cache: MaskedAttentionCache) -> int:
     return int(cache.private_keys.shape[0])
 
 
-def _cache_grid(module: nn.Module, batch_size: int, num_heads: int) -> list[list[Optional[MaskedAttentionCache]]]:
+def _cache_grid(module: nn.Module, batch_size: int, slots: int) -> list[list[Optional[MaskedAttentionCache]]]:
     grid = getattr(module, "_tee_gpu_attention_caches", None)
     if (
         grid is None
         or len(grid) != batch_size
-        or any(len(row) != num_heads for row in grid)
+        or any(len(row) != slots for row in grid)
     ):
-        grid = [[None for _ in range(num_heads)] for _ in range(batch_size)]
+        grid = [[None for _ in range(slots)] for _ in range(batch_size)]
         setattr(module, "_tee_gpu_attention_caches", grid)
     return grid
+
+
+def _transient_cache_grid(batch_size: int, slots: int) -> list[list[Optional[MaskedAttentionCache]]]:
+    return [[None for _ in range(slots)] for _ in range(batch_size)]
+
+
+def _prepare_masked_kv_cache(
+    cache_grid: list[list[Optional[MaskedAttentionCache]]],
+    *,
+    batch_index: int,
+    kv_head_index: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    config: MaskedAttentionPatchConfig,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    new_key_states: torch.Tensor,
+    new_value_states: torch.Tensor,
+    kv_len: int,
+    expected_previous: int,
+    previous_cache_length: int,
+) -> MaskedAttentionCache:
+    masked_cache = cache_grid[batch_index][kv_head_index]
+    current_len = _masked_cache_len(masked_cache) if masked_cache is not None else None
+    if masked_cache is None or current_len != expected_previous:
+        masked_cache = _new_masked_attention_cache(dim=head_dim, dtype=dtype, config=config)
+        if expected_previous == previous_cache_length and expected_previous < kv_len:
+            if expected_previous:
+                masked_cache.append(
+                    key_states[batch_index, kv_head_index, :expected_previous],
+                    value_states[batch_index, kv_head_index, :expected_previous],
+                )
+            masked_cache.append(
+                new_key_states[batch_index, kv_head_index],
+                new_value_states[batch_index, kv_head_index],
+            )
+        else:
+            masked_cache.append(
+                key_states[batch_index, kv_head_index],
+                value_states[batch_index, kv_head_index],
+            )
+        cache_grid[batch_index][kv_head_index] = masked_cache
+        return masked_cache
+
+    if new_key_states.shape[-2]:
+        masked_cache.append(
+            new_key_states[batch_index, kv_head_index],
+            new_value_states[batch_index, kv_head_index],
+        )
+    return masked_cache
 
 
 def _module_is_llama_attention(module: nn.Module) -> bool:
@@ -431,73 +481,90 @@ def masked_llama_attention_forward(
     elif getattr(self, "_tee_gpu_attention_returns_cache", False) and use_cache:
         cache = (key_states, value_states)
 
-    key_states = _repeat_kv(key_states, num_key_value_groups)
-    value_states = _repeat_kv(value_states, num_key_value_groups)
-    new_key_states = _repeat_kv(new_key_states, num_key_value_groups)
-    new_value_states = _repeat_kv(new_value_states, num_key_value_groups)
-
     kv_len = key_states.shape[-2]
     scale = float(getattr(self, "scaling", 1.0 / math.sqrt(head_dim)))
     dropout_p = float(getattr(self, "attention_dropout", 0.0)) if self.training else 0.0
-    cache_grid = _cache_grid(self, batch_size, num_heads) if (use_cache or cache is not None) else None
+    if num_heads % num_key_value_heads != 0:
+        raise ValueError("num_heads must be divisible by num_key_value_heads for GQA sharing")
+
+    persistent_cache_grid = use_cache or cache is not None
+    cache_grid = (
+        _cache_grid(self, batch_size, num_key_value_heads)
+        if persistent_cache_grid
+        else _transient_cache_grid(batch_size, num_key_value_heads)
+    )
+    expected_previous = max(kv_len - new_key_states.shape[-2], 0)
+    for batch_index in range(batch_size):
+        for kv_head_index in range(num_key_value_heads):
+            _prepare_masked_kv_cache(
+                cache_grid,
+                batch_index=batch_index,
+                kv_head_index=kv_head_index,
+                head_dim=head_dim,
+                dtype=query_states.dtype,
+                config=config,
+                key_states=key_states,
+                value_states=value_states,
+                new_key_states=new_key_states,
+                new_value_states=new_value_states,
+                kv_len=kv_len,
+                expected_previous=expected_previous,
+                previous_cache_length=previous_cache_length,
+            )
 
     head_outputs = []
     attn_weights = [] if output_attentions else None
     for batch_index in range(batch_size):
-        batch_outputs = []
-        batch_weights = [] if output_attentions else None
-        for head_index in range(num_heads):
-            query = query_states[batch_index, head_index]
-            mask = _select_attention_mask(
-                attention_mask,
-                batch_index=batch_index,
-                head_index=head_index,
-                q_len=q_len,
-                kv_len=kv_len,
-                dtype=torch.float32,
-                device=query.device,
+        batch_outputs: list[Optional[torch.Tensor]] = [None] * num_heads
+        batch_weights: list[Optional[torch.Tensor]] | None = [None] * num_heads if output_attentions else None
+        for kv_head_index in range(num_key_value_heads):
+            masked_cache = cache_grid[batch_index][kv_head_index]
+            if masked_cache is None:
+                raise RuntimeError("masked KV cache was not initialized")
+
+            start_head = kv_head_index * num_key_value_groups
+            end_head = min(start_head + num_key_value_groups, num_heads)
+            group_queries = query_states[batch_index, start_head:end_head]
+            group_heads = int(group_queries.shape[0])
+            flat_queries = group_queries.reshape(group_heads * q_len, head_dim)
+            flat_mask = torch.cat(
+                [
+                    _select_attention_mask(
+                        attention_mask,
+                        batch_index=batch_index,
+                        head_index=head_index,
+                        q_len=q_len,
+                        kv_len=kv_len,
+                        dtype=torch.float32,
+                        device=flat_queries.device,
+                    )
+                    for head_index in range(start_head, end_head)
+                ],
+                dim=0,
             )
 
-            if cache_grid is None:
-                masked_cache = _new_masked_attention_cache(dim=head_dim, dtype=query.dtype, config=config)
-                masked_cache.append(key_states[batch_index, head_index], value_states[batch_index, head_index])
-            else:
-                masked_cache = cache_grid[batch_index][head_index]
-                expected_previous = max(kv_len - new_key_states.shape[-2], 0)
-                if masked_cache is None or _masked_cache_len(masked_cache) != expected_previous:
-                    masked_cache = _new_masked_attention_cache(dim=head_dim, dtype=query.dtype, config=config)
-                    if expected_previous == previous_cache_length and expected_previous < kv_len:
-                        masked_cache.append(
-                            key_states[batch_index, head_index, :expected_previous],
-                            value_states[batch_index, head_index, :expected_previous],
-                        ) if expected_previous else None
-                        masked_cache.append(
-                            new_key_states[batch_index, head_index],
-                            new_value_states[batch_index, head_index],
-                        )
-                    else:
-                        masked_cache.append(key_states[batch_index, head_index], value_states[batch_index, head_index])
-                    cache_grid[batch_index][head_index] = masked_cache
-                else:
-                    masked_cache.append(
-                        new_key_states[batch_index, head_index],
-                        new_value_states[batch_index, head_index],
-                    )
-
             result = masked_cache.query(
-                query,
+                flat_queries,
                 scale=scale,
-                attention_mask=mask,
+                attention_mask=flat_mask,
                 dropout_p=dropout_p,
                 training=self.training,
             )
-            batch_outputs.append(result.output)
+            group_output = result.output.reshape(group_heads, q_len, head_dim)
+            for offset, head_index in enumerate(range(start_head, end_head)):
+                batch_outputs[head_index] = group_output[offset]
             if batch_weights is not None:
-                batch_weights.append(result.probabilities)
+                group_probs = result.probabilities.reshape(group_heads, q_len, kv_len)
+                for offset, head_index in enumerate(range(start_head, end_head)):
+                    batch_weights[head_index] = group_probs[offset]
 
-        head_outputs.append(torch.stack(batch_outputs, dim=0))
+        if any(output is None for output in batch_outputs):
+            raise RuntimeError("masked attention did not produce all query head outputs")
+        head_outputs.append(torch.stack([output for output in batch_outputs if output is not None], dim=0))
         if attn_weights is not None:
-            attn_weights.append(torch.stack(batch_weights, dim=0))
+            if batch_weights is None or any(weight is None for weight in batch_weights):
+                raise RuntimeError("masked attention did not produce all query head weights")
+            attn_weights.append(torch.stack([weight for weight in batch_weights if weight is not None], dim=0))
 
     attn_output = torch.stack(head_outputs, dim=0)
     attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, q_len, num_heads * head_dim)

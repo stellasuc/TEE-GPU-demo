@@ -24,7 +24,14 @@ except ModuleNotFoundError as exc:
     raise SystemExit("Install dependencies first: pip install -r requirements.txt") from exc
 
 from tee_gpu_demo.llama_patch import replace_llama_attentions, replace_llama_linears
-from tee_gpu_demo.masked_ops import MaskedAttentionCache, MaskedKVCache, masked_linear, masked_pv, masked_qk
+from tee_gpu_demo.masked_ops import (
+    MaskedAttentionCache,
+    MaskedKVCache,
+    batched_masked_attention_query,
+    masked_linear,
+    masked_pv,
+    masked_qk,
+)
 
 
 DTYPES = {
@@ -278,6 +285,43 @@ def test_masked_attention_cache(args, trusted_device, trusted_dtype, untrusted_d
     return compare("masked_attention_cache", actual, expected, atol=args.atol, rtol=args.rtol)
 
 
+def test_batched_masked_attention_query(
+    args,
+    trusted_device,
+    trusted_dtype,
+    untrusted_device,
+    untrusted_dtype,
+) -> CheckResult:
+    caches = []
+    queries = []
+    expected_outputs = []
+    for index, tokens in enumerate((5, 7, 6)):
+        cache = MaskedAttentionCache(
+            dim=16,
+            key_rank=args.rank,
+            query_rank=args.rank,
+            prob_rank=args.rank,
+            value_rank=args.rank,
+            dtype=untrusted_dtype,
+            trusted_device=trusted_device,
+            untrusted_device=untrusted_device,
+            trusted_dtype=trusted_dtype,
+            mask_scale=args.mask_scale,
+        )
+        keys = torch.randn(tokens, 16, device=trusted_device, dtype=trusted_dtype)
+        values = torch.randn(tokens, 16, device=trusted_device, dtype=trusted_dtype)
+        query = torch.randn(1 + (index % 2), 16, device=trusted_device, dtype=trusted_dtype)
+        cache.append(keys, values)
+        caches.append(cache)
+        queries.append(query)
+        expected_outputs.append(cache.baseline_query(query))
+
+    actual_outputs = [result.output for result in batched_masked_attention_query(caches, queries)]
+    actual = torch.cat(actual_outputs, dim=0)
+    expected = torch.cat(expected_outputs, dim=0)
+    return compare("batched_masked_attention_query", actual, expected, atol=args.atol, rtol=args.rtol)
+
+
 def test_replace_llama_linears(args, trusted_device, trusted_dtype, untrusted_device, untrusted_dtype) -> CheckResult:
     module = nn.Module()
     module.q_proj = nn.Linear(16, 12).to(device=trusted_device, dtype=trusted_dtype)
@@ -413,6 +457,7 @@ def main() -> None:
         test_masked_pv,
         test_masked_kv_cache,
         test_masked_attention_cache,
+        test_batched_masked_attention_query,
         test_replace_llama_linears,
         test_masked_llama_attention_prefill,
         test_masked_llama_attention_decode_cache,

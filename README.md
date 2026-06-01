@@ -21,6 +21,7 @@
 - `bench_ops.py`：测试 masked QK 的误差和耗时。
 - `demo_kv_cache.py`：演示动态 masked K cache 的追加和查询。
 - `demo_attention_cache.py`：演示 masked QK、TEE softmax、masked PV 的完整 attention 输出。
+- `demo_continuous_batching.py`：演示请求到达、分块 prefill、连续 decode batching 的调度流程。
 - `tests/test_masked_ops.py`：核心公式正确性测试。
 
 
@@ -37,6 +38,14 @@ pip install -r requirements.txt
 3090 建议按 PyTorch 官网给出的 CUDA wheel 安装命令安装 `torch`。如果要使用 Meta Llama，需要先在 HuggingFace 上同意对应模型条款，并完成登录。
 
 ## 缓存 Llama
+
+推理默认会优先读取本机已经下载好的模型目录：
+
+```text
+~/models/Llama-3.2-1B
+```
+
+代码会在启动时把它解析成绝对路径；如果该目录存在，`demo_llama.py` 和 `eval_accuracy.py` 会直接把这个本地目录传给 HuggingFace `from_pretrained()`。如果目录不存在，才回退到 `meta-llama/Llama-3.2-1B-Instruct` 和 `./model_cache` 的缓存流程。
 
 先把模型下载到默认本地缓存目录 `./model_cache`：
 
@@ -100,6 +109,7 @@ python verify_correctness.py --trusted-device cpu --untrusted-device cuda
 python profile_runtime.py --target all --untrusted-device cpu
 python profile_runtime.py --target attention --trusted-device cpu --untrusted-device cuda
 python profile_runtime.py --target llama --trusted-device cpu --untrusted-device cuda
+python profile_runtime.py --target continuous --batch 8 --trusted-device cpu --untrusted-device cuda
 ```
 
 可选导出 PyTorch profiler Chrome trace：
@@ -108,7 +118,7 @@ python profile_runtime.py --target llama --trusted-device cpu --untrusted-device
 python profile_runtime.py --target llama --torch-profiler --trace-file trace.json
 ```
 
-`--target` 支持 `linear`、`qk`、`pv`、`kv`、`attention`、`llama` 和 `all`。
+`--target` 支持 `linear`、`qk`、`pv`、`kv`、`attention`、`llama`、`continuous` 和 `all`。
 输出里的 `speedup=1.20x` 表示 masked/offload 路径比 baseline 快 20%；小于 `1.0x` 表示当前配置下反而更慢，后面的 `overhead` 会显示额外开销比例。
 
 ## 准确率评估
@@ -183,6 +193,22 @@ python demo_attention_cache.py --device cuda --tokens 1024 --chunk 128 --dim 128
 
 其中真实 Q/K/V、softmax、校正项都在 CPU；GPU 只看到 masked Q/K/P/V 并执行 masked QK 和 masked PV。
 
+## Continuous batching demo
+
+这个 demo 用随机 per-head Q/K/V 模拟多请求服务调度：请求可以按不同 step 到达，每个请求独立维护 masked K/V cache，调度器每轮接收新请求、分块 prefill，并从活跃请求中组成最多 `--max-batch-size` 个 decode token 的连续 batch。同一轮 decode 会调用 `batched_masked_attention_query`，把不同请求的 masked QK 和 masked `P @ V` padding 后合并成 batched GPU matmul；trusted side 仍逐请求做 correction 和 softmax。
+
+```bash
+python demo_continuous_batching.py --trusted-device cpu --untrusted-device cuda --requests 8 --max-batch-size 4
+```
+
+在没有 CUDA 的环境可以先用 CPU 跑：
+
+```bash
+python demo_continuous_batching.py --untrusted-device cpu --timeline
+```
+
+输出里的 `step_reduction` 是相对逐请求顺序执行的调度步数压缩比例；`max_abs_error` / `mean_abs_error` 会把连续 batching 输出和 plain attention reference 对齐，验证调度不改变结果。
+
 ## Llama demo
 
 默认使用 `meta-llama/Llama-3.2-1B-Instruct`。运行一次推理：
@@ -219,4 +245,4 @@ python demo_llama.py --untrusted-device cuda --prompt "Hello" --compare-baseline
 
 显存紧张时，优先使用 1B 模型；3B 可以尝试，但 10GB 显存下余量会更小。
 
-当前 Llama 推理路径会把选中的 `nn.Linear` 层替换为 masked Linear，并默认重写 HuggingFace `LlamaAttention.forward`：每个 head 的 masked K/V cache 会把 masked QK 与 masked `P @ V` 外包给 `--untrusted-device`，score correction、softmax、输出 correction 留在 `--trusted-device`。这个实现优先验证安全边界和公式正确性，会按 batch/head 做 Python 级循环，性能不代表最终工程化版本。
+当前 Llama 推理路径会把选中的 `nn.Linear` 层替换为 masked Linear，并默认重写 HuggingFace `LlamaAttention.forward`：GQA 下按 KV head 维护 masked K/V cache，同一 KV group 内的多个 query heads 会合并为一次 masked attention query，把 masked QK 与 masked `P @ V` 外包给 `--untrusted-device`，score correction、softmax、输出 correction 留在 `--trusted-device`。这个实现优先验证安全边界和公式正确性，会按 batch/KV group 做 Python 级循环，性能不代表最终工程化版本。

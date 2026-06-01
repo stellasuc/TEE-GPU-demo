@@ -27,6 +27,7 @@ except ModuleNotFoundError as exc:
     raise SystemExit("Install dependencies first: pip install -r requirements.txt") from exc
 
 from tee_gpu_demo.llama_patch import replace_llama_attentions
+from tee_gpu_demo.continuous_batching import ContinuousBatchingEngine, ContinuousRequest
 from tee_gpu_demo.masked_ops import MaskedAttentionCache, MaskedKVCache, masked_linear, masked_pv, masked_qk
 
 
@@ -79,7 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--target",
-        choices=("all", "linear", "qk", "pv", "kv", "attention", "llama"),
+        choices=("all", "linear", "qk", "pv", "kv", "attention", "llama", "continuous"),
         default="all",
     )
     parser.add_argument("--trusted-device", default="cpu")
@@ -559,6 +560,65 @@ def profile_llama(args, trusted_device, trusted_dtype, untrusted_device, untrust
     run_with_optional_profiler(args, masked_prefill)
 
 
+def build_continuous_requests(args, trusted_device, trusted_dtype) -> list[ContinuousRequest]:
+    requests = []
+    for index in range(args.batch):
+        prompt_len = args.tokens + (index % 3) * max(1, args.chunk // 2)
+        decode_len = args.queries + (index % 2)
+        requests.append(
+            ContinuousRequest(
+                request_id=f"req-{index}",
+                prompt_keys=torch.randn(prompt_len, args.hidden_size, device=trusted_device, dtype=trusted_dtype),
+                prompt_values=torch.randn(prompt_len, args.hidden_size, device=trusted_device, dtype=trusted_dtype),
+                decode_queries=torch.randn(decode_len, args.hidden_size, device=trusted_device, dtype=trusted_dtype),
+                decode_keys=torch.randn(decode_len, args.hidden_size, device=trusted_device, dtype=trusted_dtype),
+                decode_values=torch.randn(decode_len, args.hidden_size, device=trusted_device, dtype=trusted_dtype),
+                arrival_step=index,
+            )
+        )
+    return requests
+
+
+def profile_continuous(args, trusted_device, trusted_dtype, untrusted_device, untrusted_dtype) -> None:
+    requests = build_continuous_requests(args, trusted_device, trusted_dtype)
+    decoded_tokens = sum(request.decode_len for request in requests)
+
+    def run_engine():
+        engine = ContinuousBatchingEngine(
+            dim=args.hidden_size,
+            max_batch_size=max(1, min(args.batch, args.heads)),
+            max_active_requests=args.batch,
+            prefill_chunk=args.chunk,
+            key_rank=args.rank,
+            query_rank=args.rank,
+            prob_rank=args.rank,
+            value_rank=args.rank,
+            dtype=untrusted_dtype,
+            trusted_device=trusted_device,
+            untrusted_device=untrusted_device,
+            trusted_dtype=trusted_dtype,
+            mask_scale=args.mask_scale,
+        )
+        engine.submit_many(requests)
+        return engine.run()
+
+    print("\n[continuous batching]")
+    result = time_ms(
+        run_engine,
+        warmup=max(1, args.warmup // 2),
+        repeats=max(1, args.repeats // 2),
+        trusted_device=trusted_device,
+        untrusted_device=untrusted_device,
+    )
+    print_result(
+        "continuous engine",
+        result,
+        work_units=decoded_tokens,
+        unit="decoded_tokens",
+    )
+    run_with_optional_profiler(args, run_engine)
+
+
 def main() -> None:
     args = parse_args()
     trusted_device = torch.device(args.trusted_device)
@@ -592,6 +652,7 @@ def main() -> None:
         "kv": profile_kv,
         "attention": profile_attention,
         "llama": profile_llama,
+        "continuous": profile_continuous,
     }
     selected = targets.keys() if args.target == "all" else (args.target,)
     for target in selected:
