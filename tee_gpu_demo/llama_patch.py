@@ -11,7 +11,7 @@ from typing import Iterable, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from .masked_ops import MaskedAttentionCache, masked_linear
+from .masked_ops import MaskedAttentionCache, batched_masked_attention_query, masked_linear
 
 
 DEFAULT_LLAMA_LINEAR_NAMES = (
@@ -512,11 +512,11 @@ def masked_llama_attention_forward(
                 previous_cache_length=previous_cache_length,
             )
 
-    head_outputs = []
-    attn_weights = [] if output_attentions else None
+    query_caches = []
+    query_tensors = []
+    query_masks = []
+    query_meta = []
     for batch_index in range(batch_size):
-        batch_outputs: list[Optional[torch.Tensor]] = [None] * num_heads
-        batch_weights: list[Optional[torch.Tensor]] | None = [None] * num_heads if output_attentions else None
         for kv_head_index in range(num_key_value_heads):
             masked_cache = cache_grid[batch_index][kv_head_index]
             if masked_cache is None:
@@ -526,7 +526,7 @@ def masked_llama_attention_forward(
             end_head = min(start_head + num_key_value_groups, num_heads)
             group_queries = query_states[batch_index, start_head:end_head]
             group_heads = int(group_queries.shape[0])
-            group_mask = torch.stack(
+            group_mask = torch.cat(
                 [
                     _select_attention_mask(
                         attention_mask,
@@ -542,37 +542,55 @@ def masked_llama_attention_forward(
                 dim=0,
             )
 
-            result = masked_cache.query(
-                group_queries,
-                scale=scale,
-                attention_mask=group_mask,
-                dropout_p=dropout_p,
-                training=self.training,
-            )
-            group_output = result.output
-            for offset, head_index in enumerate(range(start_head, end_head)):
-                batch_outputs[head_index] = group_output[offset]
-            if batch_weights is not None:
-                group_probs = result.probabilities
-                for offset, head_index in enumerate(range(start_head, end_head)):
-                    batch_weights[head_index] = group_probs[offset]
+            query_caches.append(masked_cache)
+            query_tensors.append(group_queries.reshape(group_heads * q_len, head_dim))
+            query_masks.append(group_mask)
+            query_meta.append((batch_index, start_head, end_head, group_heads))
 
-        if any(output is None for output in batch_outputs):
-            raise RuntimeError("masked attention did not produce all query head outputs")
-        head_outputs.append(torch.stack([output for output in batch_outputs if output is not None], dim=0))
+    query_results = batched_masked_attention_query(
+        query_caches,
+        query_tensors,
+        scale=scale,
+        attention_masks=query_masks,
+        dropout_p=dropout_p,
+        training=self.training,
+    )
+
+    head_outputs: list[list[Optional[torch.Tensor]]] = [[None] * num_heads for _ in range(batch_size)]
+    attn_weights = [[None] * num_heads for _ in range(batch_size)] if output_attentions else None
+    for result, (batch_index, start_head, end_head, group_heads) in zip(query_results, query_meta):
+        group_output = result.output.reshape(group_heads, q_len, head_dim)
+        for offset, head_index in enumerate(range(start_head, end_head)):
+            head_outputs[batch_index][head_index] = group_output[offset]
         if attn_weights is not None:
-            if batch_weights is None or any(weight is None for weight in batch_weights):
-                raise RuntimeError("masked attention did not produce all query head weights")
-            attn_weights.append(torch.stack([weight for weight in batch_weights if weight is not None], dim=0))
+            group_probs = result.probabilities.reshape(group_heads, q_len, kv_len)
+            for offset, head_index in enumerate(range(start_head, end_head)):
+                attn_weights[batch_index][head_index] = group_probs[offset]
 
-    attn_output = torch.stack(head_outputs, dim=0)
-    attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, q_len, num_heads * head_dim)
+    if any(any(output is None for output in batch_outputs) for batch_outputs in head_outputs):
+        raise RuntimeError("masked attention did not produce all query head outputs")
+    head_outputs_t = torch.stack(
+        [
+            torch.stack([output for output in batch_outputs if output is not None], dim=0)
+            for batch_outputs in head_outputs
+        ],
+        dim=0,
+    )
+    if attn_weights is not None:
+        if any(any(weight is None for weight in batch_weights) for batch_weights in attn_weights):
+            raise RuntimeError("masked attention did not produce all query head weights")
+        attn_weights = torch.stack(
+            [
+                torch.stack([weight for weight in batch_weights if weight is not None], dim=0)
+                for batch_weights in attn_weights
+            ],
+            dim=0,
+        )
+
+    attn_output = head_outputs_t.transpose(1, 2).contiguous().reshape(batch_size, q_len, num_heads * head_dim)
     attn_output = self.o_proj(attn_output)
     if config.return_to_input_device:
         attn_output = attn_output.to(device=input_device, dtype=input_dtype)
-
-    if attn_weights is not None:
-        attn_weights = torch.stack(attn_weights, dim=0)
 
     if getattr(self, "_tee_gpu_attention_returns_cache", False):
         return attn_output, attn_weights, cache if use_cache else None
