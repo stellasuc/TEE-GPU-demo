@@ -141,6 +141,31 @@ class MaskedOpsTest(unittest.TestCase):
 
         self.assertTrue(torch.allclose(actual, expected, atol=1e-5, rtol=1e-5))
 
+    def test_masked_attention_cache_batches_query_correction(self) -> None:
+        from tee_gpu_demo.masked_ops import MaskedAttentionCache
+
+        cache = MaskedAttentionCache(
+            dim=8,
+            key_rank=3,
+            query_rank=2,
+            prob_rank=3,
+            value_rank=2,
+            device=torch.device("cpu"),
+        )
+        keys = torch.randn(5, 8)
+        values = torch.randn(5, 8)
+        cache.append(keys, values)
+
+        q = torch.randn(2, 3, 8)
+        attention_mask = torch.zeros(2, 3, 5)
+        attention_mask[:, :, 4:] = torch.finfo(torch.float32).min
+
+        scores = q @ keys.transpose(-1, -2) / (8**0.5)
+        expected = torch.softmax(scores + attention_mask, dim=-1) @ values
+        actual = cache.query(q, attention_mask=attention_mask).output
+
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-5, rtol=1e-5))
+
     def test_batched_masked_attention_query_matches_plain_attention(self) -> None:
         from tee_gpu_demo.masked_ops import MaskedAttentionCache, batched_masked_attention_query
 

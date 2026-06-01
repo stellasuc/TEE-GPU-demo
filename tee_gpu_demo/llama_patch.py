@@ -526,8 +526,7 @@ def masked_llama_attention_forward(
             end_head = min(start_head + num_key_value_groups, num_heads)
             group_queries = query_states[batch_index, start_head:end_head]
             group_heads = int(group_queries.shape[0])
-            flat_queries = group_queries.reshape(group_heads * q_len, head_dim)
-            flat_mask = torch.cat(
+            group_mask = torch.stack(
                 [
                     _select_attention_mask(
                         attention_mask,
@@ -536,7 +535,7 @@ def masked_llama_attention_forward(
                         q_len=q_len,
                         kv_len=kv_len,
                         dtype=torch.float32,
-                        device=flat_queries.device,
+                        device=group_queries.device,
                     )
                     for head_index in range(start_head, end_head)
                 ],
@@ -544,17 +543,17 @@ def masked_llama_attention_forward(
             )
 
             result = masked_cache.query(
-                flat_queries,
+                group_queries,
                 scale=scale,
-                attention_mask=flat_mask,
+                attention_mask=group_mask,
                 dropout_p=dropout_p,
                 training=self.training,
             )
-            group_output = result.output.reshape(group_heads, q_len, head_dim)
+            group_output = result.output
             for offset, head_index in enumerate(range(start_head, end_head)):
                 batch_outputs[head_index] = group_output[offset]
             if batch_weights is not None:
-                group_probs = result.probabilities.reshape(group_heads, q_len, kv_len)
+                group_probs = result.probabilities
                 for offset, head_index in enumerate(range(start_head, end_head)):
                     batch_weights[head_index] = group_probs[offset]
 
