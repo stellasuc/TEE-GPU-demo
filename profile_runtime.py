@@ -535,6 +535,31 @@ def profile_llama(args, trusted_device, trusted_dtype, untrusted_device, untrust
     hidden = torch.randn(args.batch, args.seq, args.hidden_size, device=trusted_device, dtype=trusted_dtype)
     attention_mask = causal_mask(args.seq, args.seq, device=trusted_device, dtype=trusted_dtype).view(1, 1, args.seq, args.seq)
     attention_mask = attention_mask.expand(args.batch, 1, args.seq, args.seq).clone()
+
+    def baseline_prefill():
+        attn = module.attn
+        batch_size, seq_len, _ = hidden.shape
+        head_dim = attn.head_dim
+        q = attn.q_proj(hidden).view(batch_size, seq_len, args.heads, head_dim).transpose(1, 2)
+        k = attn.k_proj(hidden).view(batch_size, seq_len, args.kv_heads, head_dim).transpose(1, 2)
+        v = attn.v_proj(hidden).view(batch_size, seq_len, args.kv_heads, head_dim).transpose(1, 2)
+        k = repeat_kv(k, attn.num_key_value_groups)
+        v = repeat_kv(v, attn.num_key_value_groups)
+        scores = (q @ k.transpose(-1, -2)) * attn.scaling
+        scores = scores + attention_mask.to(device=scores.device, dtype=scores.dtype)
+        probs = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+        output = probs @ v
+        output = output.transpose(1, 2).contiguous().reshape(batch_size, seq_len, args.heads * head_dim)
+        return attn.o_proj(output)
+
+    baseline_result = time_ms(
+        baseline_prefill,
+        warmup=args.warmup,
+        repeats=args.repeats,
+        trusted_device=trusted_device,
+        untrusted_device=untrusted_device,
+    )
+
     replace_llama_attentions(
         module,
         key_rank=args.rank,
@@ -552,11 +577,25 @@ def profile_llama(args, trusted_device, trusted_dtype, untrusted_device, untrust
 
     print("\n[patched llama attention]")
     print_result(
-        "masked llama prefill",
-        time_ms(masked_prefill, warmup=args.warmup, repeats=args.repeats, trusted_device=trusted_device, untrusted_device=untrusted_device),
+        "baseline llama prefill",
+        baseline_result,
         work_units=args.batch * args.seq,
         unit="tokens",
     )
+    masked_result = time_ms(
+        masked_prefill,
+        warmup=args.warmup,
+        repeats=args.repeats,
+        trusted_device=trusted_device,
+        untrusted_device=untrusted_device,
+    )
+    print_result(
+        "masked llama prefill",
+        masked_result,
+        work_units=args.batch * args.seq,
+        unit="tokens",
+    )
+    print_speedup("llama masked/baseline", baseline_result, masked_result)
     run_with_optional_profiler(args, masked_prefill)
 
 
