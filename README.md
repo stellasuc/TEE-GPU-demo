@@ -245,4 +245,4 @@ python demo_llama.py --untrusted-device cuda --prompt "Hello" --compare-baseline
 
 显存紧张时，优先使用 1B 模型；3B 可以尝试，但 10GB 显存下余量会更小。
 
-当前 Llama 推理路径会把选中的 `nn.Linear` 层替换为 masked Linear，并默认重写 HuggingFace `LlamaAttention.forward`：GQA 下按 KV head 维护 masked K/V cache，同一 KV group 内的多个 query heads 会合并为一次 masked attention query，把 masked QK 与 masked `P @ V` 外包给 `--untrusted-device`，score correction、softmax、输出 correction 留在 `--trusted-device`。这个实现优先验证安全边界和公式正确性，会按 batch/KV group 做 Python 级循环，性能不代表最终工程化版本。
+当前 Llama 推理路径会把选中的 `nn.Linear` 层替换为 masked Linear，并默认重写 HuggingFace `LlamaAttention.forward`：GQA 下按 KV head 维护 masked K/V cache，GPU 侧 masked K/V 使用 append-only contiguous buffer 复用历史 token，同一 KV group 内的多个 query heads 会合并为一次 masked attention query，把 masked QK 与 masked `P @ V` 外包给 `--untrusted-device`，score correction、softmax、输出 correction 留在 `--trusted-device`。这个实现优先验证安全边界和公式正确性，会按 batch/KV group 做 Python 级循环，性能不代表最终工程化版本。

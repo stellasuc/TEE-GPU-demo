@@ -85,6 +85,36 @@ class MaskedOpsTest(unittest.TestCase):
 
         self.assertTrue(torch.allclose(actual, expected, atol=1e-5, rtol=1e-5))
 
+    def test_masked_attention_cache_uses_contiguous_buffers(self) -> None:
+        from tee_gpu_demo.masked_ops import MaskedAttentionCache
+
+        cache = MaskedAttentionCache(
+            dim=8,
+            key_rank=3,
+            query_rank=2,
+            prob_rank=3,
+            value_rank=2,
+            device=torch.device("cpu"),
+        )
+        cache.append(torch.randn(2, 8), torch.randn(2, 8))
+        cache.append(torch.randn(3, 8), torch.randn(3, 8))
+
+        masked_keys = cache.masked_keys
+        masked_values = cache.masked_values
+        private_values = cache.private_values
+
+        self.assertEqual(cache.seq_len, 5)
+        self.assertEqual(tuple(masked_keys.shape), (5, 8))
+        self.assertEqual(tuple(masked_values.shape), (5, 8))
+        self.assertEqual(tuple(cache.k_cache.basis_to_masked.shape), (2, 5))
+        self.assertEqual(masked_keys.data_ptr(), cache.masked_keys.data_ptr())
+        self.assertEqual(masked_values.data_ptr(), cache.masked_values.data_ptr())
+        self.assertEqual(private_values.data_ptr(), cache.private_values.data_ptr())
+
+        cache.query(torch.randn(1, 8))
+        self.assertEqual(masked_keys.data_ptr(), cache.masked_keys.data_ptr())
+        self.assertEqual(masked_values.data_ptr(), cache.masked_values.data_ptr())
+
     def test_masked_attention_cache_applies_attention_mask(self) -> None:
         from tee_gpu_demo.masked_ops import MaskedAttentionCache
 

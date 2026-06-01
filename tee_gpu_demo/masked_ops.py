@@ -140,6 +140,52 @@ class UntrustedGPU:
         return torch.matmul(masked_p, masked_v)
 
 
+class _TokenBuffer:
+    """Append-only contiguous buffer for token-major tensors shaped [tokens, dim]."""
+
+    def __init__(self, dim: int, *, dtype: torch.dtype, device: torch.device) -> None:
+        self.dim = dim
+        self.dtype = dtype
+        self.device = device
+        self.length = 0
+        self._data: Optional[Tensor] = None
+
+    @property
+    def capacity(self) -> int:
+        return 0 if self._data is None else int(self._data.shape[0])
+
+    def _reserve(self, required: int) -> None:
+        if required <= self.capacity:
+            return
+        new_capacity = max(required, max(1, self.capacity * 2))
+        new_data = torch.empty((new_capacity, self.dim), dtype=self.dtype, device=self.device)
+        if self._data is not None and self.length:
+            new_data[: self.length].copy_(self._data[: self.length])
+        self._data = new_data
+
+    def append(self, chunk: Tensor) -> Tensor:
+        if chunk.ndim != 2 or chunk.shape[-1] != self.dim:
+            raise ValueError(f"chunk must be shaped [tokens, {self.dim}]")
+        if chunk.device != self.device or chunk.dtype != self.dtype:
+            chunk = chunk.to(device=self.device, dtype=self.dtype)
+
+        rows = int(chunk.shape[0])
+        if rows == 0:
+            return torch.empty((0, self.dim), dtype=self.dtype, device=self.device)
+
+        start = self.length
+        end = start + rows
+        self._reserve(end)
+        self._data[start:end].copy_(chunk)
+        self.length = end
+        return self._data[start:end]
+
+    def tensor(self) -> Tensor:
+        if self._data is None:
+            return torch.empty((0, self.dim), dtype=self.dtype, device=self.device)
+        return self._data[: self.length]
+
+
 def masked_linear(
     x: Tensor,
     weight: Tensor,
@@ -458,11 +504,15 @@ class MaskedKVCache:
             generator=generator,
             scale=mask_scale,
         )
-        # Keep private chunks only on the simulated trusted side.
-        self._private_chunks: List[Tensor] = []
-        self._masked_chunks: List[Tensor] = []
+        # Keep private K on the trusted side and masked K in one GPU-visible buffer.
+        self._private_buffer = _TokenBuffer(dim, dtype=self.trusted_dtype, device=self.trusted_device)
+        self._masked_buffer = _TokenBuffer(dim, dtype=dtype, device=self.untrusted_device)
         self._key_masks: List[LowRankMask] = []
-        self._basis_to_masked_chunks: List[Tensor] = []
+        self._basis_to_masked_buffer = _TokenBuffer(
+            query_rank,
+            dtype=self.trusted_dtype,
+            device=self.trusted_device,
+        )
 
     def append(self, keys: Tensor) -> Tensor:
         """Append private keys and return the masked chunk visible to the GPU."""
@@ -481,27 +531,32 @@ class MaskedKVCache:
         masked_t = keys + mask.materialize()
         masked = masked_t.to(device=self.untrusted_device, dtype=self.dtype)
 
-        self._private_chunks.append(keys)
-        self._masked_chunks.append(masked)
+        self._private_buffer.append(keys)
+        masked_slice = self._masked_buffer.append(masked)
         self._key_masks.append(mask)
         # Trusted side: precompute G @ K_masked.T so query correction stays small.
-        self._basis_to_masked_chunks.append(torch.matmul(self.query_basis, masked_t.transpose(-1, -2)))
-        return masked
+        basis_to_masked = torch.matmul(self.query_basis, masked_t.transpose(-1, -2))
+        self._basis_to_masked_buffer.append(basis_to_masked.transpose(0, 1).contiguous())
+        return masked_slice
+
+    @property
+    def seq_len(self) -> int:
+        return self._masked_buffer.length
 
     @property
     def private_keys(self) -> Tensor:
-        if not self._private_chunks:
-            return torch.empty((0, self.dim), dtype=self.trusted_dtype, device=self.trusted_device)
-        return torch.cat(self._private_chunks, dim=0)
+        return self._private_buffer.tensor()
 
     @property
     def masked_keys(self) -> Tensor:
-        if not self._masked_chunks:
-            return torch.empty((0, self.dim), dtype=self.dtype, device=self.untrusted_device)
-        return torch.cat(self._masked_chunks, dim=0)
+        return self._masked_buffer.tensor()
+
+    @property
+    def basis_to_masked(self) -> Tensor:
+        return self._basis_to_masked_buffer.tensor().transpose(0, 1)
 
     def query(self, q: Tensor) -> MaskedKVQueryResult:
-        if not self._masked_chunks:
+        if self.seq_len == 0:
             raise RuntimeError("append at least one key chunk before querying")
         if q.shape[-1] != self.dim:
             raise ValueError(f"query hidden size must be {self.dim}")
@@ -531,8 +586,7 @@ class MaskedKVCache:
         q_key_mask = torch.cat(q_key_mask_terms, dim=-1)
 
         # Trusted side: subtract the query mask term using the precomputed basis product.
-        basis_to_masked = torch.cat(self._basis_to_masked_chunks, dim=-1)
-        query_mask_term = torch.matmul(u, basis_to_masked)
+        query_mask_term = torch.matmul(u, self.basis_to_masked)
 
         correction = q_key_mask + query_mask_term
         output = masked_output_t - correction
@@ -616,8 +670,8 @@ class MaskedAttentionCache:
             mask_scale=mask_scale,
             generator=generator,
         )
-        self._private_value_chunks: List[Tensor] = []
-        self._masked_value_chunks: List[Tensor] = []
+        self._private_value_buffer = _TokenBuffer(dim, dtype=self.trusted_dtype, device=self.trusted_device)
+        self._masked_value_buffer = _TokenBuffer(dim, dtype=dtype, device=self.untrusted_device)
         self._value_masks: List[LowRankMask] = []
 
     def append(self, keys: Tensor, values: Tensor) -> tuple[Tensor, Tensor]:
@@ -641,22 +695,22 @@ class MaskedAttentionCache:
         masked_values_t = values + value_mask.materialize()
         masked_values = masked_values_t.to(device=self.untrusted_device, dtype=self.dtype)
 
-        self._private_value_chunks.append(values)
-        self._masked_value_chunks.append(masked_values)
+        self._private_value_buffer.append(values)
+        masked_value_slice = self._masked_value_buffer.append(masked_values)
         self._value_masks.append(value_mask)
-        return masked_keys, masked_values
+        return masked_keys, masked_value_slice
+
+    @property
+    def seq_len(self) -> int:
+        return self.k_cache.seq_len
 
     @property
     def private_values(self) -> Tensor:
-        if not self._private_value_chunks:
-            return torch.empty((0, self.dim), dtype=self.trusted_dtype, device=self.trusted_device)
-        return torch.cat(self._private_value_chunks, dim=0)
+        return self._private_value_buffer.tensor()
 
     @property
     def masked_values(self) -> Tensor:
-        if not self._masked_value_chunks:
-            return torch.empty((0, self.dim), dtype=self.dtype, device=self.untrusted_device)
-        return torch.cat(self._masked_value_chunks, dim=0)
+        return self._masked_value_buffer.tensor()
 
     @property
     def private_keys(self) -> Tensor:
@@ -700,7 +754,7 @@ class MaskedAttentionCache:
         dropout_p: float = 0.0,
         training: bool = False,
     ) -> MaskedAttentionQueryResult:
-        if not self._masked_value_chunks:
+        if self.seq_len == 0:
             raise RuntimeError("append at least one K/V chunk before querying")
 
         q = q.to(device=self.trusted_device, dtype=self.trusted_dtype)
@@ -792,7 +846,7 @@ def batched_masked_attention_query(
             raise ValueError("all caches must use the same trusted and untrusted devices")
         if cache.trusted_dtype != trusted_dtype or cache.dtype != untrusted_dtype:
             raise ValueError("all caches must use the same trusted and untrusted dtypes")
-        if not cache._masked_value_chunks:
+        if cache.seq_len == 0:
             raise RuntimeError("append at least one K/V chunk to every cache before querying")
 
     trusted_queries: List[Tensor] = []
@@ -820,9 +874,10 @@ def batched_masked_attention_query(
         trusted_queries.append(q)
         trusted_u.append(u)
         masked_queries.append(masked_query)
-        masked_keys.append(cache.masked_keys)
+        masked_key = cache.masked_keys
+        masked_keys.append(masked_key)
         q_lens.append(q.shape[-2])
-        kv_lens.append(cache.masked_keys.shape[-2])
+        kv_lens.append(masked_key.shape[-2])
 
     batch_size = len(caches)
     max_q_len = max(q_lens)
@@ -848,8 +903,7 @@ def batched_masked_attention_query(
         for key_mask in cache.k_cache._key_masks:
             q_key_mask_terms.append(_q_times_low_rank_t(q.unsqueeze(-2), key_mask).squeeze(-2))
         q_key_mask = torch.cat(q_key_mask_terms, dim=-1)
-        basis_to_masked = torch.cat(cache.k_cache._basis_to_masked_chunks, dim=-1)
-        query_mask_term = torch.matmul(u, basis_to_masked)
+        query_mask_term = torch.matmul(u, cache.k_cache.basis_to_masked)
         qk_correction = q_key_mask + query_mask_term
 
         unscaled_scores = qk_masked_output_t[index, :q_len, :kv_len] - qk_correction

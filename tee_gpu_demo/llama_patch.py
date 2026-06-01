@@ -352,7 +352,7 @@ def _new_masked_attention_cache(
 
 
 def _masked_cache_len(cache: MaskedAttentionCache) -> int:
-    return int(cache.private_keys.shape[0])
+    return int(cache.seq_len)
 
 
 def _cache_grid(module: nn.Module, batch_size: int, slots: int) -> list[list[Optional[MaskedAttentionCache]]]:
