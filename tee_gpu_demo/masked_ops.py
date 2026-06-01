@@ -238,19 +238,19 @@ def masked_linear(
     # Untrusted side: perform only the expensive matmul on masked data.
     masked_output = UntrustedGPU.linear(masked_input, weight_u)
 
-    # Trusted side: subtract the mask contribution to recover x @ W.T.
+    # Trusted side: compute correction while the untrusted matmul can run asynchronously.
     trusted_out_dtype = correction_dtype or trusted_dtype
-    masked_output_t = masked_output.to(device=trusted_device, dtype=trusted_out_dtype)
     if correction_dtype is None:
         correction = F.linear(mask, weight_t, bias=None)
-        output = masked_output_t - correction
     else:
         correction = F.linear(
             mask.to(correction_dtype),
             weight_t.to(correction_dtype),
             bias=None,
         )
-        output = masked_output_t - correction
+
+    masked_output_t = masked_output.to(device=trusted_device, dtype=trusted_out_dtype)
+    output = masked_output_t - correction
 
     if bias_t is not None:
         output = output + bias_t.to(output.dtype)
@@ -347,9 +347,8 @@ def masked_qk(
     masked_q = masked_q_t.to(device=untrusted_device, dtype=untrusted_dtype)
     masked_k = masked_k_t.to(device=untrusted_device, dtype=untrusted_dtype)
 
-    # Untrusted side: compute the full attention score matrix on masked Q/K.
+    # Untrusted side: launch masked QK; trusted correction below can overlap on CUDA.
     masked_output = UntrustedGPU.qk(masked_q, masked_k)
-    masked_output_t = masked_output.to(device=trusted_device, dtype=trusted_dtype)
 
     # Trusted side: remove Q @ Rk.T, Rq @ K.T, and Rq @ Rk.T.
     correction = (
@@ -357,6 +356,7 @@ def masked_qk(
         + _low_rank_times_k_t(q_mask, k)
         + _low_rank_cross(q_mask, k_mask)
     )
+    masked_output_t = masked_output.to(device=trusted_device, dtype=trusted_dtype)
     output = masked_output_t - correction
 
     return MaskedQKResult(
@@ -425,9 +425,8 @@ def masked_pv(
     masked_p_t = p + p_mask.materialize()
     masked_p = masked_p_t.to(device=untrusted_device, dtype=untrusted_dtype)
 
-    # Untrusted side: compute the heavy probability-value matmul on masked data.
+    # Untrusted side: launch masked PV; trusted correction below can overlap on CUDA.
     masked_output = UntrustedGPU.pv(masked_p, masked_v)
-    masked_output_t = masked_output.to(device=trusted_device, dtype=trusted_dtype)
 
     # Trusted side: remove P @ Rv, Rp @ V, and Rp @ Rv.
     correction = (
@@ -435,6 +434,7 @@ def masked_pv(
         + _low_rank_times_x(p_mask, v)
         + _low_rank_product(p_mask, v_mask)
     )
+    masked_output_t = masked_output.to(device=trusted_device, dtype=trusted_dtype)
     output = masked_output_t - correction
 
     return MaskedPVResult(
@@ -574,10 +574,9 @@ class MaskedKVCache:
         masked_query_t = q + query_mask
         masked_query = masked_query_t.to(device=self.untrusted_device, dtype=self.dtype)
 
-        # Untrusted side: score the masked query against the masked K cache.
+        # Untrusted side: launch masked QK against the masked K cache.
         masked_keys = self.masked_keys
         masked_output = torch.matmul(masked_query, masked_keys.transpose(-1, -2))
-        masked_output_t = masked_output.to(device=self.trusted_device, dtype=self.trusted_dtype)
 
         # Trusted side: subtract the per-key mask terms chunk by chunk.
         q_key_mask_terms = []
@@ -589,6 +588,7 @@ class MaskedKVCache:
         query_mask_term = torch.matmul(u, self.basis_to_masked)
 
         correction = q_key_mask + query_mask_term
+        masked_output_t = masked_output.to(device=self.trusted_device, dtype=self.trusted_dtype)
         output = masked_output_t - correction
         return MaskedKVQueryResult(
             output=output,
@@ -781,7 +781,6 @@ class MaskedAttentionCache:
         masked_p_t = probabilities + p_mask.materialize()
         masked_p = masked_p_t.to(device=self.untrusted_device, dtype=self.dtype)
         masked_output = UntrustedGPU.pv(masked_p, self.masked_values)
-        masked_output_t = masked_output.to(device=self.trusted_device, dtype=self.trusted_dtype)
 
         # Step 4: remove P @ Rv, Rp @ V, and Rp @ Rv.
         correction = (
@@ -789,6 +788,7 @@ class MaskedAttentionCache:
             + _low_rank_times_x(p_mask, self.private_values)
             + self._p_mask_times_value_masks(p_mask)
         )
+        masked_output_t = masked_output.to(device=self.trusted_device, dtype=self.trusted_dtype)
         output = masked_output_t - correction
 
         return MaskedAttentionQueryResult(
@@ -891,21 +891,24 @@ def batched_masked_attention_query(
         padded_k[index, :kv_len] = masked_key
 
     qk_masked_output = torch.bmm(padded_q, padded_k.transpose(1, 2))
-    qk_masked_output_t = qk_masked_output.to(device=trusted_device, dtype=trusted_dtype)
 
-    probabilities: List[Tensor] = []
-    p_masks: List[LowRankMask] = []
-    scores_list: List[Tensor] = []
-    for index, (cache, q, u, attention_mask, q_len, kv_len) in enumerate(
-        zip(caches, trusted_queries, trusted_u, attention_masks, q_lens, kv_lens)
-    ):
+    qk_corrections: List[Tensor] = []
+    for cache, q, u in zip(caches, trusted_queries, trusted_u):
         q_key_mask_terms = []
         for key_mask in cache.k_cache._key_masks:
             q_key_mask_terms.append(_q_times_low_rank_t(q.unsqueeze(-2), key_mask).squeeze(-2))
         q_key_mask = torch.cat(q_key_mask_terms, dim=-1)
         query_mask_term = torch.matmul(u, cache.k_cache.basis_to_masked)
-        qk_correction = q_key_mask + query_mask_term
+        qk_corrections.append(q_key_mask + query_mask_term)
 
+    qk_masked_output_t = qk_masked_output.to(device=trusted_device, dtype=trusted_dtype)
+
+    probabilities: List[Tensor] = []
+    p_masks: List[LowRankMask] = []
+    scores_list: List[Tensor] = []
+    for index, (cache, attention_mask, q_len, kv_len, qk_correction) in enumerate(
+        zip(caches, attention_masks, q_lens, kv_lens, qk_corrections)
+    ):
         unscaled_scores = qk_masked_output_t[index, :q_len, :kv_len] - qk_correction
         request_scale = scale if scale is not None else 1.0 / math.sqrt(cache.dim)
         scores = unscaled_scores * request_scale
@@ -932,15 +935,19 @@ def batched_masked_attention_query(
         padded_v[index, :kv_len] = cache.masked_values
 
     pv_masked_output = torch.bmm(padded_p, padded_v)
-    pv_masked_output_t = pv_masked_output.to(device=trusted_device, dtype=trusted_dtype)
 
-    results: List[MaskedAttentionQueryResult] = []
-    for index, (cache, probs, p_mask, q_len, kv_len) in enumerate(zip(caches, probabilities, p_masks, q_lens, kv_lens)):
-        correction = (
+    pv_corrections: List[Tensor] = []
+    for cache, probs, p_mask in zip(caches, probabilities, p_masks):
+        pv_corrections.append(
             cache._p_times_value_masks(probs)
             + _low_rank_times_x(p_mask, cache.private_values)
             + cache._p_mask_times_value_masks(p_mask)
         )
+
+    pv_masked_output_t = pv_masked_output.to(device=trusted_device, dtype=trusted_dtype)
+
+    results: List[MaskedAttentionQueryResult] = []
+    for index, (probs, correction, q_len, kv_len) in enumerate(zip(probabilities, pv_corrections, q_lens, kv_lens)):
         output = pv_masked_output_t[index, :q_len] - correction
         results.append(
             MaskedAttentionQueryResult(
