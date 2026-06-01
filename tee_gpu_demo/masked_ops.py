@@ -50,6 +50,48 @@ def _default_trusted_dtype(device: torch.device, dtype: torch.dtype) -> torch.dt
     return dtype
 
 
+def _pin_if_cuda_copy(tensor: Tensor, target_device: torch.device) -> Tensor:
+    if tensor.device.type != "cpu" or target_device.type != "cuda":
+        return tensor
+    try:
+        return tensor if tensor.is_pinned() else tensor.pin_memory()
+    except RuntimeError:
+        return tensor
+
+
+def _to_device_async(tensor: Tensor, *, device: torch.device, dtype: torch.dtype) -> Tensor:
+    if tensor.device == device and tensor.dtype == dtype:
+        return tensor
+    source = _pin_if_cuda_copy(tensor, device)
+    return source.to(device=device, dtype=dtype, non_blocking=True)
+
+
+def _copy_to_trusted_async(
+    tensor: Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[Tensor, Optional[torch.cuda.Stream]]:
+    if tensor.device == device and tensor.dtype == dtype:
+        return tensor, None
+    if tensor.device.type == "cuda" and device.type == "cpu":
+        try:
+            output = torch.empty(tensor.shape, dtype=dtype, device=device, pin_memory=True)
+            stream = torch.cuda.Stream(device=tensor.device)
+            stream.wait_stream(torch.cuda.current_stream(tensor.device))
+            with torch.cuda.stream(stream):
+                output.copy_(tensor, non_blocking=True)
+            return output, stream
+        except RuntimeError:
+            pass
+    return tensor.to(device=device, dtype=dtype, non_blocking=True), None
+
+
+def _wait_for_copy(stream: Optional[torch.cuda.Stream]) -> None:
+    if stream is not None:
+        stream.synchronize()
+
+
 @dataclass
 class MaskedLinearResult:
     output: Tensor
@@ -167,7 +209,7 @@ class _TokenBuffer:
         if chunk.ndim != 2 or chunk.shape[-1] != self.dim:
             raise ValueError(f"chunk must be shaped [tokens, {self.dim}]")
         if chunk.device != self.device or chunk.dtype != self.dtype:
-            chunk = chunk.to(device=self.device, dtype=self.dtype)
+            chunk = _to_device_async(chunk, device=self.device, dtype=self.dtype)
 
         rows = int(chunk.shape[0])
         if rows == 0:
@@ -176,7 +218,7 @@ class _TokenBuffer:
         start = self.length
         end = start + rows
         self._reserve(end)
-        self._data[start:end].copy_(chunk)
+        self._data[start:end].copy_(chunk, non_blocking=True)
         self.length = end
         return self._data[start:end]
 
@@ -232,11 +274,16 @@ def masked_linear(
 
     # Trusted side: hide the private activation before it leaves the boundary.
     masked_input_t = x_t + mask
-    masked_input = masked_input_t.to(device=untrusted_device, dtype=untrusted_dtype)
-    weight_u = weight.to(device=untrusted_device, dtype=untrusted_dtype)
+    masked_input = _to_device_async(masked_input_t, device=untrusted_device, dtype=untrusted_dtype)
+    weight_u = _to_device_async(weight, device=untrusted_device, dtype=untrusted_dtype)
 
     # Untrusted side: perform only the expensive matmul on masked data.
     masked_output = UntrustedGPU.linear(masked_input, weight_u)
+    masked_output_t, output_copy_stream = _copy_to_trusted_async(
+        masked_output,
+        device=trusted_device,
+        dtype=correction_dtype or trusted_dtype,
+    )
 
     # Trusted side: compute correction while the untrusted matmul can run asynchronously.
     trusted_out_dtype = correction_dtype or trusted_dtype
@@ -249,7 +296,7 @@ def masked_linear(
             bias=None,
         )
 
-    masked_output_t = masked_output.to(device=trusted_device, dtype=trusted_out_dtype)
+    _wait_for_copy(output_copy_stream)
     output = masked_output_t - correction
 
     if bias_t is not None:
@@ -344,11 +391,16 @@ def masked_qk(
     # Trusted side: materialize low-rank masks only for the tensors sent out.
     masked_q_t = q + q_mask.materialize()
     masked_k_t = k + k_mask.materialize()
-    masked_q = masked_q_t.to(device=untrusted_device, dtype=untrusted_dtype)
-    masked_k = masked_k_t.to(device=untrusted_device, dtype=untrusted_dtype)
+    masked_q = _to_device_async(masked_q_t, device=untrusted_device, dtype=untrusted_dtype)
+    masked_k = _to_device_async(masked_k_t, device=untrusted_device, dtype=untrusted_dtype)
 
     # Untrusted side: launch masked QK; trusted correction below can overlap on CUDA.
     masked_output = UntrustedGPU.qk(masked_q, masked_k)
+    masked_output_t, output_copy_stream = _copy_to_trusted_async(
+        masked_output,
+        device=trusted_device,
+        dtype=trusted_dtype,
+    )
 
     # Trusted side: remove Q @ Rk.T, Rq @ K.T, and Rq @ Rk.T.
     correction = (
@@ -356,7 +408,7 @@ def masked_qk(
         + _low_rank_times_k_t(q_mask, k)
         + _low_rank_cross(q_mask, k_mask)
     )
-    masked_output_t = masked_output.to(device=trusted_device, dtype=trusted_dtype)
+    _wait_for_copy(output_copy_stream)
     output = masked_output_t - correction
 
     return MaskedQKResult(
@@ -413,20 +465,25 @@ def masked_pv(
     if v_mask is None:
         v_mask = LowRankMask.random(v, rank_v, generator=generator, scale=mask_scale)
         masked_v_t = v + v_mask.materialize()
-        masked_v = masked_v_t.to(device=untrusted_device, dtype=untrusted_dtype)
+        masked_v = _to_device_async(masked_v_t, device=untrusted_device, dtype=untrusted_dtype)
     else:
         v_mask = LowRankMask(
             v_mask.left.to(device=trusted_device, dtype=trusted_dtype),
             v_mask.right.to(device=trusted_device, dtype=trusted_dtype),
         )
-        masked_v = masked_v.to(device=untrusted_device, dtype=untrusted_dtype)
+        masked_v = _to_device_async(masked_v, device=untrusted_device, dtype=untrusted_dtype)
 
     # Trusted side: hide both P and V before offloading P @ V.
     masked_p_t = p + p_mask.materialize()
-    masked_p = masked_p_t.to(device=untrusted_device, dtype=untrusted_dtype)
+    masked_p = _to_device_async(masked_p_t, device=untrusted_device, dtype=untrusted_dtype)
 
     # Untrusted side: launch masked PV; trusted correction below can overlap on CUDA.
     masked_output = UntrustedGPU.pv(masked_p, masked_v)
+    masked_output_t, output_copy_stream = _copy_to_trusted_async(
+        masked_output,
+        device=trusted_device,
+        dtype=trusted_dtype,
+    )
 
     # Trusted side: remove P @ Rv, Rp @ V, and Rp @ Rv.
     correction = (
@@ -434,7 +491,7 @@ def masked_pv(
         + _low_rank_times_x(p_mask, v)
         + _low_rank_product(p_mask, v_mask)
     )
-    masked_output_t = masked_output.to(device=trusted_device, dtype=trusted_dtype)
+    _wait_for_copy(output_copy_stream)
     output = masked_output_t - correction
 
     return MaskedPVResult(
@@ -529,7 +586,7 @@ class MaskedKVCache:
             scale=self.mask_scale,
         )
         masked_t = keys + mask.materialize()
-        masked = masked_t.to(device=self.untrusted_device, dtype=self.dtype)
+        masked = _to_device_async(masked_t, device=self.untrusted_device, dtype=self.dtype)
 
         self._private_buffer.append(keys)
         masked_slice = self._masked_buffer.append(masked)
@@ -572,11 +629,16 @@ class MaskedKVCache:
         )
         query_mask = torch.matmul(u, self.query_basis)
         masked_query_t = q + query_mask
-        masked_query = masked_query_t.to(device=self.untrusted_device, dtype=self.dtype)
+        masked_query = _to_device_async(masked_query_t, device=self.untrusted_device, dtype=self.dtype)
 
         # Untrusted side: launch masked QK against the masked K cache.
         masked_keys = self.masked_keys
         masked_output = torch.matmul(masked_query, masked_keys.transpose(-1, -2))
+        masked_output_t, output_copy_stream = _copy_to_trusted_async(
+            masked_output,
+            device=self.trusted_device,
+            dtype=self.trusted_dtype,
+        )
 
         # Trusted side: subtract the per-key mask terms chunk by chunk.
         q_key_mask_terms = []
@@ -588,7 +650,7 @@ class MaskedKVCache:
         query_mask_term = torch.matmul(u, self.basis_to_masked)
 
         correction = q_key_mask + query_mask_term
-        masked_output_t = masked_output.to(device=self.trusted_device, dtype=self.trusted_dtype)
+        _wait_for_copy(output_copy_stream)
         output = masked_output_t - correction
         return MaskedKVQueryResult(
             output=output,
@@ -693,7 +755,7 @@ class MaskedAttentionCache:
             scale=self.mask_scale,
         )
         masked_values_t = values + value_mask.materialize()
-        masked_values = masked_values_t.to(device=self.untrusted_device, dtype=self.dtype)
+        masked_values = _to_device_async(masked_values_t, device=self.untrusted_device, dtype=self.dtype)
 
         self._private_value_buffer.append(values)
         masked_value_slice = self._masked_value_buffer.append(masked_values)
@@ -779,8 +841,13 @@ class MaskedAttentionCache:
             scale=self.mask_scale,
         )
         masked_p_t = probabilities + p_mask.materialize()
-        masked_p = masked_p_t.to(device=self.untrusted_device, dtype=self.dtype)
+        masked_p = _to_device_async(masked_p_t, device=self.untrusted_device, dtype=self.dtype)
         masked_output = UntrustedGPU.pv(masked_p, self.masked_values)
+        masked_output_t, output_copy_stream = _copy_to_trusted_async(
+            masked_output,
+            device=self.trusted_device,
+            dtype=self.trusted_dtype,
+        )
 
         # Step 4: remove P @ Rv, Rp @ V, and Rp @ Rv.
         correction = (
@@ -788,7 +855,7 @@ class MaskedAttentionCache:
             + _low_rank_times_x(p_mask, self.private_values)
             + self._p_mask_times_value_masks(p_mask)
         )
-        masked_output_t = masked_output.to(device=self.trusted_device, dtype=self.trusted_dtype)
+        _wait_for_copy(output_copy_stream)
         output = masked_output_t - correction
 
         return MaskedAttentionQueryResult(
@@ -869,7 +936,7 @@ def batched_masked_attention_query(
         )
         query_mask = torch.matmul(u, cache.k_cache.query_basis)
         masked_query_t = q + query_mask
-        masked_query = masked_query_t.to(device=untrusted_device, dtype=untrusted_dtype)
+        masked_query = _to_device_async(masked_query_t, device=untrusted_device, dtype=untrusted_dtype)
 
         trusted_queries.append(q)
         trusted_u.append(u)
@@ -891,6 +958,11 @@ def batched_masked_attention_query(
         padded_k[index, :kv_len] = masked_key
 
     qk_masked_output = torch.bmm(padded_q, padded_k.transpose(1, 2))
+    qk_masked_output_t, qk_copy_stream = _copy_to_trusted_async(
+        qk_masked_output,
+        device=trusted_device,
+        dtype=trusted_dtype,
+    )
 
     qk_corrections: List[Tensor] = []
     for cache, q, u in zip(caches, trusted_queries, trusted_u):
@@ -901,7 +973,7 @@ def batched_masked_attention_query(
         query_mask_term = torch.matmul(u, cache.k_cache.basis_to_masked)
         qk_corrections.append(q_key_mask + query_mask_term)
 
-    qk_masked_output_t = qk_masked_output.to(device=trusted_device, dtype=trusted_dtype)
+    _wait_for_copy(qk_copy_stream)
 
     probabilities: List[Tensor] = []
     p_masks: List[LowRankMask] = []
@@ -931,10 +1003,19 @@ def batched_masked_attention_query(
     padded_v = torch.zeros((batch_size, max_kv_len, dim), dtype=untrusted_dtype, device=untrusted_device)
     for index, (cache, probs, p_mask, q_len, kv_len) in enumerate(zip(caches, probabilities, p_masks, q_lens, kv_lens)):
         masked_p_t = probs + p_mask.materialize()
-        padded_p[index, :q_len, :kv_len] = masked_p_t.to(device=untrusted_device, dtype=untrusted_dtype)
+        padded_p[index, :q_len, :kv_len] = _to_device_async(
+            masked_p_t,
+            device=untrusted_device,
+            dtype=untrusted_dtype,
+        )
         padded_v[index, :kv_len] = cache.masked_values
 
     pv_masked_output = torch.bmm(padded_p, padded_v)
+    pv_masked_output_t, pv_copy_stream = _copy_to_trusted_async(
+        pv_masked_output,
+        device=trusted_device,
+        dtype=trusted_dtype,
+    )
 
     pv_corrections: List[Tensor] = []
     for cache, probs, p_mask in zip(caches, probabilities, p_masks):
@@ -944,7 +1025,7 @@ def batched_masked_attention_query(
             + cache._p_mask_times_value_masks(p_mask)
         )
 
-    pv_masked_output_t = pv_masked_output.to(device=trusted_device, dtype=trusted_dtype)
+    _wait_for_copy(pv_copy_stream)
 
     results: List[MaskedAttentionQueryResult] = []
     for index, (probs, correction, q_len, kv_len) in enumerate(zip(probabilities, pv_corrections, q_lens, kv_lens)):
