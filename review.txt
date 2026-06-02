@@ -1,0 +1,10 @@
+
+
+用 monkey patch 在 runtime 替换 HuggingFace LlamaAttention.forward，
+这样不用 fork Transformers 源码，也能把原模型接入我的 masked attention offload path。
+module._tee_gpu_original_forward = module.forward
+module.forward = MethodType(masked_llama_attention_forward, module)
+原来:
+LlamaAttention.forward -> HuggingFace 原生 attention
+替换后:
+LlamaAttention.forward -> masked_llama_attention_forward
