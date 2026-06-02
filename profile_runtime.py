@@ -92,6 +92,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument("--rank", type=int, default=4)
     parser.add_argument("--mask-scale", type=float, default=0.02)
+    parser.add_argument(
+        "--trusted-pv",
+        action="store_true",
+        help="Only offload masked QK; keep softmax P @ V on the trusted side.",
+    )
 
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--seq", type=int, default=128)
@@ -457,6 +462,7 @@ def build_attention_cache(args, trusted_device, trusted_dtype, untrusted_device,
         untrusted_device=untrusted_device,
         trusted_dtype=trusted_dtype,
         mask_scale=args.mask_scale,
+        offload_pv=not args.trusted_pv,
     )
     remaining = args.tokens
     while remaining > 0:
@@ -570,6 +576,7 @@ def profile_llama(args, trusted_device, trusted_dtype, untrusted_device, untrust
         trusted_device=trusted_device,
         untrusted_device=untrusted_device,
         trusted_dtype=trusted_dtype,
+        offload_pv=not args.trusted_pv,
     )
 
     def masked_prefill():
@@ -637,6 +644,7 @@ def profile_continuous(args, trusted_device, trusted_dtype, untrusted_device, un
             untrusted_device=untrusted_device,
             trusted_dtype=trusted_dtype,
             mask_scale=args.mask_scale,
+            offload_pv=not args.trusted_pv,
         )
         engine.submit_many(requests)
         return engine.run()

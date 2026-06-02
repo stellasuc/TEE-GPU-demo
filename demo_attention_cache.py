@@ -23,6 +23,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-rank", type=int, default=4)
     parser.add_argument("--prob-rank", type=int, default=4)
     parser.add_argument("--value-rank", type=int, default=4)
+    parser.add_argument(
+        "--trusted-pv",
+        action="store_true",
+        help="Only offload masked QK; keep softmax P @ V on the trusted side.",
+    )
     parser.add_argument("--trusted-device", default="cpu")
     parser.add_argument("--untrusted-device", default=default_device())
     parser.add_argument("--device", default=None, help="Alias for --untrusted-device.")
@@ -53,6 +58,7 @@ def main() -> None:
         trusted_dtype=trusted_dtype,
         trusted_device=trusted_device,
         untrusted_device=untrusted_device,
+        offload_pv=not args.trusted_pv,
     )
 
     remaining = args.tokens
@@ -76,6 +82,7 @@ def main() -> None:
         "ranks="
         f"key:{args.key_rank} query:{args.query_rank} prob:{args.prob_rank} value:{args.value_rank}"
     )
+    print(f"pv_mode={'trusted' if args.trusted_pv else 'masked_offload'}")
     print(f"max_abs_error={err.max().item():.6g}")
     print(f"mean_abs_error={err.mean().item():.6g}")
 

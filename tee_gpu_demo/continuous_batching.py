@@ -134,6 +134,7 @@ class ContinuousBatchingEngine:
         untrusted_device: torch.device | str | None = None,
         trusted_dtype: torch.dtype | None = None,
         mask_scale: float = 0.02,
+        offload_pv: bool = True,
         generator: Optional[torch.Generator] = None,
     ) -> None:
         if dim <= 0:
@@ -156,6 +157,7 @@ class ContinuousBatchingEngine:
         self.untrusted_device = torch.device(untrusted_device) if untrusted_device is not None else self.trusted_device
         self.trusted_dtype = trusted_dtype or (torch.float32 if self.trusted_device.type == "cpu" else dtype)
         self.mask_scale = mask_scale
+        self.offload_pv = offload_pv
         self.generator = generator
 
         self._pending: List[ContinuousRequest] = []
@@ -190,6 +192,7 @@ class ContinuousBatchingEngine:
             untrusted_device=self.untrusted_device,
             trusted_dtype=self.trusted_dtype,
             mask_scale=self.mask_scale,
+            offload_pv=self.offload_pv,
             generator=self.generator,
         )
 

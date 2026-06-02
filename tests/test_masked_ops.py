@@ -166,6 +166,28 @@ class MaskedOpsTest(unittest.TestCase):
 
         self.assertTrue(torch.allclose(actual, expected, atol=1e-5, rtol=1e-5))
 
+    def test_masked_attention_cache_can_keep_pv_trusted(self) -> None:
+        from tee_gpu_demo.masked_ops import MaskedAttentionCache
+
+        cache = MaskedAttentionCache(
+            dim=8,
+            key_rank=3,
+            query_rank=2,
+            prob_rank=3,
+            value_rank=2,
+            device=torch.device("cpu"),
+            offload_pv=False,
+        )
+        keys = torch.randn(5, 8)
+        values = torch.randn(5, 8)
+        cache.append(keys, values)
+
+        q = torch.randn(2, 3, 8)
+        expected = cache.baseline_query(q)
+        actual = cache.query(q).output
+
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-5, rtol=1e-5))
+
     def test_batched_masked_attention_query_matches_plain_attention(self) -> None:
         from tee_gpu_demo.masked_ops import MaskedAttentionCache, batched_masked_attention_query
 

@@ -102,6 +102,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attention-prob-rank", type=int, default=4)
     parser.add_argument("--attention-value-rank", type=int, default=4)
     parser.add_argument(
+        "--trusted-pv",
+        action="store_true",
+        help="Only offload masked QK; keep softmax P @ V on the trusted side.",
+    )
+    parser.add_argument(
         "--sum-logprob",
         action="store_true",
         help="Use summed log-probability instead of length-normalized score.",
@@ -401,6 +406,7 @@ def main() -> None:
                 untrusted_device=args.untrusted_device,
                 trusted_dtype=trusted_dtype,
                 return_to_input_device=args.compat_return_to_model_device,
+                offload_pv=not args.trusted_pv,
             )
             print(f"patched_attentions={attention_report.replaced}")
         for task in tasks:

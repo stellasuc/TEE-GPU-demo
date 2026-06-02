@@ -87,6 +87,7 @@ class MaskedAttentionPatchConfig:
     untrusted_device: torch.device | str | None = None
     trusted_dtype: torch.dtype | None = None
     return_to_input_device: bool = False
+    offload_pv: bool = True
 
 
 def _to_device(device: torch.device | str | None, fallback: torch.device) -> torch.device:
@@ -348,6 +349,7 @@ def _new_masked_attention_cache(
         trusted_device=trusted_device,
         untrusted_device=untrusted_device,
         mask_scale=config.mask_scale,
+        offload_pv=config.offload_pv,
     )
 
 
@@ -609,6 +611,7 @@ def replace_llama_attentions(
     untrusted_device: torch.device | str | None = None,
     trusted_dtype: torch.dtype | None = None,
     return_to_input_device: bool = False,
+    offload_pv: bool = True,
 ) -> PatchReport:
     """Replace LlamaAttention.forward in-place with masked attention offload."""
 
@@ -627,6 +630,7 @@ def replace_llama_attentions(
         untrusted_device=untrusted_device,
         trusted_dtype=trusted_dtype,
         return_to_input_device=return_to_input_device,
+        offload_pv=offload_pv,
     )
     for name in targets:
         parent, child_name = _get_parent(model, name)

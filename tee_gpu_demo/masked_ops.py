@@ -537,6 +537,7 @@ class MaskedKVCache:
         untrusted_device: Optional[torch.device | str] = None,
         trusted_dtype: Optional[torch.dtype] = None,
         mask_scale: float = 0.02,
+        offload_pv: bool = True,
         generator: Optional[torch.Generator] = None,
     ) -> None:
         if key_rank <= 0 or query_rank <= 0:
@@ -552,6 +553,7 @@ class MaskedKVCache:
         # Keep the old attribute as the GPU-side device for compatibility with demos.
         self.device = self.untrusted_device
         self.mask_scale = mask_scale
+        self.offload_pv = offload_pv
         self.generator = generator
 
         self.query_basis = _randn(
@@ -747,19 +749,23 @@ class MaskedAttentionCache:
         masked_keys = self.k_cache.append(keys)
 
         values = values.to(device=self.trusted_device, dtype=self.trusted_dtype)
-        # Trusted side: V gets its own dynamic low-rank mask before GPU caching.
-        value_mask = LowRankMask.random(
-            values,
-            self.value_rank,
-            generator=self.generator,
-            scale=self.mask_scale,
-        )
-        masked_values_t = values + value_mask.materialize()
-        masked_values = _to_device_async(masked_values_t, device=self.untrusted_device, dtype=self.dtype)
+        if self.offload_pv:
+            # Trusted side: V gets its own dynamic low-rank mask before GPU caching.
+            value_mask = LowRankMask.random(
+                values,
+                self.value_rank,
+                generator=self.generator,
+                scale=self.mask_scale,
+            )
+            masked_values_t = values + value_mask.materialize()
+            masked_values = _to_device_async(masked_values_t, device=self.untrusted_device, dtype=self.dtype)
+            self._value_masks.append(value_mask)
+        else:
+            value_mask = None
+            masked_values = torch.empty((values.shape[0], self.dim), dtype=self.dtype, device=self.untrusted_device)
 
         self._private_value_buffer.append(values)
         masked_value_slice = self._masked_value_buffer.append(masked_values)
-        self._value_masks.append(value_mask)
         return masked_keys, masked_value_slice
 
     @property
@@ -832,6 +838,17 @@ class MaskedAttentionCache:
         probabilities = torch.softmax(scores.float(), dim=-1).to(self.trusted_dtype)
         if dropout_p:
             probabilities = F.dropout(probabilities, p=dropout_p, training=training)
+
+        if not self.offload_pv:
+            output = torch.matmul(probabilities, self.private_values)
+            return MaskedAttentionQueryResult(
+                output=output,
+                scores=scores,
+                probabilities=probabilities,
+                qk_masked_output=qk_result.masked_output,
+                pv_masked_output=output,
+                correction=torch.zeros_like(output),
+            )
 
         # Step 3: mask P and use the dynamic masked V cache for GPU-side P @ V.
         p_mask = LowRankMask.random(
@@ -913,6 +930,8 @@ def batched_masked_attention_query(
             raise ValueError("all caches must use the same trusted and untrusted devices")
         if cache.trusted_dtype != trusted_dtype or cache.dtype != untrusted_dtype:
             raise ValueError("all caches must use the same trusted and untrusted dtypes")
+        if cache.offload_pv != caches[0].offload_pv:
+            raise ValueError("all caches must use the same PV offload mode")
         if cache.seq_len == 0:
             raise RuntimeError("append at least one K/V chunk to every cache before querying")
 
@@ -989,15 +1008,34 @@ def batched_masked_attention_query(
         probs = torch.softmax(scores.float(), dim=-1).to(trusted_dtype)
         if dropout_p:
             probs = F.dropout(probs, p=dropout_p, training=training)
-        p_mask = LowRankMask.random(
-            probs,
-            cache.prob_rank,
-            generator=cache.generator,
-            scale=cache.mask_scale,
-        )
         scores_list.append(scores)
         probabilities.append(probs)
-        p_masks.append(p_mask)
+
+    if not caches[0].offload_pv:
+        results: List[MaskedAttentionQueryResult] = []
+        for index, (cache, probs, q_len, kv_len) in enumerate(zip(caches, probabilities, q_lens, kv_lens)):
+            output = torch.matmul(probs, cache.private_values)
+            results.append(
+                MaskedAttentionQueryResult(
+                    output=output,
+                    scores=scores_list[index],
+                    probabilities=probs,
+                    qk_masked_output=qk_masked_output[index, :q_len, :kv_len],
+                    pv_masked_output=output,
+                    correction=torch.zeros_like(output),
+                )
+            )
+        return results
+
+    for cache, probs in zip(caches, probabilities):
+        p_masks.append(
+            LowRankMask.random(
+                probs,
+                cache.prob_rank,
+                generator=cache.generator,
+                scale=cache.mask_scale,
+            )
+        )
 
     padded_p = torch.zeros((batch_size, max_q_len, max_kv_len), dtype=untrusted_dtype, device=untrusted_device)
     padded_v = torch.zeros((batch_size, max_kv_len, dim), dtype=untrusted_dtype, device=untrusted_device)
