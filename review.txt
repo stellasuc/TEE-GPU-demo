@@ -1,10 +1,49 @@
 
+没有改模型权重加载逻辑，而是通过 monkey patch 替换 attention forward 和 Linear module，使原 HuggingFace 模型能走 masked offload path。
+
+
+我做了 GQA shared KV cache，让多个 Q heads 共享同一个 KV head 的 masked K/V；
+做了 batched query，把 batch × kv_heads 的 group query 一次送进 batched masked attention；
+加了 pinned memory、non-blocking copy 和 CUDA stream，让 GPU matmul/D2H 和 CPU correction 尽量 overlap；
+还加了 --trusted-pv ablation，只 masked QK，把 PV 留在 trusted side。
+
+Llama 是 GQA，num_heads > num_key_value_heads。
+例如 32 个 Q heads、8 个 KV heads，则每 4 个 Q heads 共享 1 个 KV head。
+优化后每个 KV head 的 K/V 只 mask/cache 一次，对应 group 的多个 Q heads 共享这个 cache。
+
+
+它模拟 serving 中多个 request 不同时间到达。
+每个 request 有自己的 masked K/V cache，scheduler 每轮 admit 新请求、分块 prefill、把活跃请求的 decode token 组成 batch，
+然后用 batched masked attention query 一次跑 GPU QK/PV。
+
+
+为什么 masked 版本有时比 baseline 慢？
+因为当前 prototype 多了 H2D/D2H transfer、mask generation、low-rank correction、P mask materialization、Python loop 和 small GEMM。
+尤其 long prefill 下 P 是 [heads, seq, seq]，masked PV 会产生 O(seq²) 额外成本。
+
+
+
 
 用 monkey patch 在 runtime 替换 HuggingFace LlamaAttention.forward，
 这样不用 fork Transformers 源码，也能把原模型接入我的 masked attention offload path。
+
 module._tee_gpu_original_forward = module.forward
 module.forward = MethodType(masked_llama_attention_forward, module)
 原来:
 LlamaAttention.forward -> HuggingFace 原生 attention
 替换后:
 LlamaAttention.forward -> masked_llama_attention_forward
+
+
+profiling 时用了 warmup 排除 CUDA 初始化、内存 allocator 和 kernel cold start 的影响，然后对 repeats 次正式运行取平均 latency。
+为什么需要 warmup：
+CUDA 第一次调用会初始化 context
+1. PyTorch 第一次可能会初始化 kernel / allocator
+2. GPU 频率需要升上来：GPU 不是一直满频运行。空闲时它会降频省电，第一次开始计算时，频率会逐渐从低频升到高频。
+3.cache: 第一次运行时，很多数据、kernel metadata、内存块都还没准备好。跑过几次后，后续访问可能更快。
+比如第一次做某个 shape 的 matmul，PyTorch/CUDA 需要准备一些内部状态；后面再跑同样 shape，就可以复用。
+4. 内存分配：PyTorch CUDA allocator 不是每次都直接向 GPU driver 申请显存。
+第一次需要某个大小的 tensor 时，它可能会向 CUDA driver 申请一大块显存；之后释放 tensor 时，这块显存通常不会真的还给系统，而是留在 PyTorch cache 里复用。
+5. cuBLAS autotune：cuBLASLt 会根据矩阵 shape、dtype、layout 等选择一个合适算法。
+有些情况下第一次运行会做 heuristic / algorithm selection，后续相同 shape 可以复用选择结果。所以第一次 matmul 可能包含额外开销，不只是纯计算时间。
+所以不 warmup 的结果通常不稳定，第一次会偏慢。

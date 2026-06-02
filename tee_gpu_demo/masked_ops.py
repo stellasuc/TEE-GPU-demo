@@ -537,7 +537,6 @@ class MaskedKVCache:
         untrusted_device: Optional[torch.device | str] = None,
         trusted_dtype: Optional[torch.dtype] = None,
         mask_scale: float = 0.02,
-        offload_pv: bool = True,
         generator: Optional[torch.Generator] = None,
     ) -> None:
         if key_rank <= 0 or query_rank <= 0:
@@ -553,7 +552,6 @@ class MaskedKVCache:
         # Keep the old attribute as the GPU-side device for compatibility with demos.
         self.device = self.untrusted_device
         self.mask_scale = mask_scale
-        self.offload_pv = offload_pv
         self.generator = generator
 
         self.query_basis = _randn(
@@ -706,6 +704,7 @@ class MaskedAttentionCache:
         untrusted_device: Optional[torch.device | str] = None,
         trusted_dtype: Optional[torch.dtype] = None,
         mask_scale: float = 0.02,
+        offload_pv: bool = True,
         generator: Optional[torch.Generator] = None,
     ) -> None:
         if prob_rank <= 0 or value_rank <= 0:
@@ -720,6 +719,7 @@ class MaskedAttentionCache:
         self.trusted_dtype = trusted_dtype or _default_trusted_dtype(self.trusted_device, dtype)
         self.device = self.untrusted_device
         self.mask_scale = mask_scale
+        self.offload_pv = offload_pv
         self.generator = generator
 
         self.k_cache = MaskedKVCache(
