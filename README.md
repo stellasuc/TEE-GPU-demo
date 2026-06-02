@@ -119,6 +119,7 @@ python profile_runtime.py --target llama --torch-profiler --trace-file trace.jso
 ```
 
 `--target` 支持 `linear`、`qk`、`pv`、`kv`、`attention`、`llama`、`continuous` 和 `all`。
+其中 `--target llama` 会同时输出完整 prompt prefill 和单 token decode step 的 baseline/masked 结果；decode 会先构建 1 次 prefill cache，再在计时区间连续执行 `--repeats` 个 decode token。
 输出里的 `speedup=1.20x` 表示 masked/offload 路径比 baseline 快 20%；小于 `1.0x` 表示当前配置下反而更慢，后面的 `overhead` 会显示额外开销比例。
 
 ## 准确率评估

@@ -72,7 +72,18 @@ class FakeModernAttention(nn.Module):
         self.v_proj = nn.Linear(hidden_size, num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(num_heads * self.head_dim, hidden_size, bias=False)
 
-    def forward(self, hidden_states, **kwargs):
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position=None,
+        position_embeddings=None,
+        **kwargs,
+    ):
         raise NotImplementedError("replace_llama_attentions() should patch this method.")
 
 
@@ -155,6 +166,33 @@ def time_ms(
     for _ in range(repeats):
         fn()
     sync(trusted_device, untrusted_device)
+    elapsed_ms = (time.perf_counter() - start) * 1000.0 / repeats
+    return BenchResult(name="", ms=elapsed_ms, peak_mb=peak_memory_mb(trusted_device, untrusted_device))
+
+
+def time_stateful_ms(
+    build_state: Callable[[], object],
+    step_fn: Callable[[object, int], object],
+    *,
+    warmup: int,
+    repeats: int,
+    trusted_device: torch.device,
+    untrusted_device: torch.device,
+) -> BenchResult:
+    with torch.inference_mode():
+        warm_state = build_state()
+        sync(trusted_device, untrusted_device)
+        for index in range(warmup):
+            step_fn(warm_state, index)
+        sync(trusted_device, untrusted_device)
+
+        state = build_state()
+        sync(trusted_device, untrusted_device)
+        reset_peak_memory(trusted_device, untrusted_device)
+        start = time.perf_counter()
+        for index in range(repeats):
+            step_fn(state, index)
+        sync(trusted_device, untrusted_device)
     elapsed_ms = (time.perf_counter() - start) * 1000.0 / repeats
     return BenchResult(name="", ms=elapsed_ms, peak_mb=peak_memory_mb(trusted_device, untrusted_device))
 
@@ -539,27 +577,70 @@ def profile_llama(args, trusted_device, trusted_dtype, untrusted_device, untrust
         dtype=trusted_dtype,
     )
     hidden = torch.randn(args.batch, args.seq, args.hidden_size, device=trusted_device, dtype=trusted_dtype)
+    decode_steps = max(args.warmup, args.repeats, 1)
+    decode_hidden = torch.randn(
+        args.batch,
+        decode_steps,
+        args.hidden_size,
+        device=trusted_device,
+        dtype=trusted_dtype,
+    )
     attention_mask = causal_mask(args.seq, args.seq, device=trusted_device, dtype=trusted_dtype).view(1, 1, args.seq, args.seq)
     attention_mask = attention_mask.expand(args.batch, 1, args.seq, args.seq).clone()
 
     def baseline_prefill():
+        with torch.inference_mode():
+            attn = module.attn
+            batch_size, seq_len, _ = hidden.shape
+            head_dim = attn.head_dim
+            q = attn.q_proj(hidden).view(batch_size, seq_len, args.heads, head_dim).transpose(1, 2)
+            k = attn.k_proj(hidden).view(batch_size, seq_len, args.kv_heads, head_dim).transpose(1, 2)
+            v = attn.v_proj(hidden).view(batch_size, seq_len, args.kv_heads, head_dim).transpose(1, 2)
+            k = repeat_kv(k, attn.num_key_value_groups)
+            v = repeat_kv(v, attn.num_key_value_groups)
+            scores = (q @ k.transpose(-1, -2)) * attn.scaling
+            scores = scores + attention_mask.to(device=scores.device, dtype=scores.dtype)
+            probs = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+            output = probs @ v
+            output = output.transpose(1, 2).contiguous().reshape(batch_size, seq_len, args.heads * head_dim)
+            return attn.o_proj(output)
+
+    def build_baseline_decode_state():
         attn = module.attn
         batch_size, seq_len, _ = hidden.shape
         head_dim = attn.head_dim
-        q = attn.q_proj(hidden).view(batch_size, seq_len, args.heads, head_dim).transpose(1, 2)
         k = attn.k_proj(hidden).view(batch_size, seq_len, args.kv_heads, head_dim).transpose(1, 2)
         v = attn.v_proj(hidden).view(batch_size, seq_len, args.kv_heads, head_dim).transpose(1, 2)
-        k = repeat_kv(k, attn.num_key_value_groups)
-        v = repeat_kv(v, attn.num_key_value_groups)
+        return {"k": k, "v": v}
+
+    def baseline_decode_step(state, step_index: int):
+        attn = module.attn
+        token = decode_hidden[:, step_index % decode_hidden.shape[1] : step_index % decode_hidden.shape[1] + 1]
+        batch_size, q_len, _ = token.shape
+        head_dim = attn.head_dim
+        q = attn.q_proj(token).view(batch_size, q_len, args.heads, head_dim).transpose(1, 2)
+        new_k = attn.k_proj(token).view(batch_size, q_len, args.kv_heads, head_dim).transpose(1, 2)
+        new_v = attn.v_proj(token).view(batch_size, q_len, args.kv_heads, head_dim).transpose(1, 2)
+        state["k"] = torch.cat([state["k"], new_k], dim=2)
+        state["v"] = torch.cat([state["v"], new_v], dim=2)
+        k = repeat_kv(state["k"], attn.num_key_value_groups)
+        v = repeat_kv(state["v"], attn.num_key_value_groups)
         scores = (q @ k.transpose(-1, -2)) * attn.scaling
-        scores = scores + attention_mask.to(device=scores.device, dtype=scores.dtype)
         probs = torch.softmax(scores.float(), dim=-1).to(q.dtype)
         output = probs @ v
-        output = output.transpose(1, 2).contiguous().reshape(batch_size, seq_len, args.heads * head_dim)
+        output = output.transpose(1, 2).contiguous().reshape(batch_size, q_len, args.heads * head_dim)
         return attn.o_proj(output)
 
     baseline_result = time_ms(
         baseline_prefill,
+        warmup=args.warmup,
+        repeats=args.repeats,
+        trusted_device=trusted_device,
+        untrusted_device=untrusted_device,
+    )
+    baseline_decode_result = time_stateful_ms(
+        build_baseline_decode_state,
+        baseline_decode_step,
         warmup=args.warmup,
         repeats=args.repeats,
         trusted_device=trusted_device,
@@ -580,7 +661,28 @@ def profile_llama(args, trusted_device, trusted_dtype, untrusted_device, untrust
     )
 
     def masked_prefill():
-        return module.attn(hidden, attention_mask=attention_mask, output_attentions=False)[0]
+        with torch.inference_mode():
+            return module.attn(hidden, attention_mask=attention_mask, output_attentions=False)[0]
+
+    def build_masked_decode_state():
+        output = module.attn(
+            hidden,
+            attention_mask=attention_mask,
+            output_attentions=False,
+            use_cache=True,
+        )
+        return {"cache": output[2]}
+
+    def masked_decode_step(state, step_index: int):
+        token = decode_hidden[:, step_index % decode_hidden.shape[1] : step_index % decode_hidden.shape[1] + 1]
+        output = module.attn(
+            token,
+            past_key_value=state["cache"],
+            output_attentions=False,
+            use_cache=True,
+        )
+        state["cache"] = output[2]
+        return output[0]
 
     print("\n[patched llama attention]")
     print_result(
@@ -602,8 +704,36 @@ def profile_llama(args, trusted_device, trusted_dtype, untrusted_device, untrust
         work_units=args.batch * args.seq,
         unit="tokens",
     )
-    print_speedup("llama masked/baseline", baseline_result, masked_result)
-    run_with_optional_profiler(args, masked_prefill)
+    masked_decode_result = time_stateful_ms(
+        build_masked_decode_state,
+        masked_decode_step,
+        warmup=args.warmup,
+        repeats=args.repeats,
+        trusted_device=trusted_device,
+        untrusted_device=untrusted_device,
+    )
+    print_result(
+        "baseline llama decode",
+        baseline_decode_result,
+        work_units=args.batch,
+        unit="decode_tokens",
+    )
+    print_result(
+        "masked llama decode",
+        masked_decode_result,
+        work_units=args.batch,
+        unit="decode_tokens",
+    )
+    print_speedup("llama prefill masked/baseline", baseline_result, masked_result)
+    print_speedup("llama decode masked/baseline", baseline_decode_result, masked_decode_result)
+
+    def masked_profile_run():
+        with torch.inference_mode():
+            masked_prefill()
+            state = build_masked_decode_state()
+            masked_decode_step(state, 0)
+
+    run_with_optional_profiler(args, masked_profile_run)
 
 
 def build_continuous_requests(args, trusted_device, trusted_dtype) -> list[ContinuousRequest]:
